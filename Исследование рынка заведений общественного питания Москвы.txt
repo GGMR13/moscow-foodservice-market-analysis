@@ -1,0 +1,159 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+
+# 1. Загрузка и первичный анализ данных
+data = pd.read_csv('data/logs_exp.csv', delimiter='\t')
+data.rename(columns=str.lower, inplace=True)
+
+# Проверка структуры данных, пропусков и дубликатов
+print("Информация о данных:")
+print(data.info())
+print("\nПропуски в данных:")
+print(data.isna().sum())
+print("\nДубликаты:")
+print(data.duplicated().sum())
+print("\nПервые строки:")
+print(data.head())
+
+# 2. Подготовка данных
+# Переименование столбцов для удобства
+data.columns = ['event', 'user', 'timestamp', 'group']
+
+# Создание столбцов с датой и временем
+data['datetime'] = pd.to_datetime(data['timestamp'], unit='s')
+data['date'] = data['datetime'].dt.date
+
+# Удаление дубликатов (одинаковый user, event, timestamp, group)
+initial_rows = len(data)
+data = data.drop_duplicates()
+data = data.reset_index(drop=True)
+print(f"\nУдалено дубликатов: {initial_rows - len(data)}")
+
+# 3. Анализ полноты данных по времени
+print(f"\nПериод данных: с {data['datetime'].min()} по {data['datetime'].max()}")
+
+# Фильтрация данных: оставляем только полные данные (с 1 августа 2019)
+data_clean = data.loc[data['date'] > '2019-07-31'].reset_index(drop=True)
+
+# Оценка потерь при фильтрации
+loss_users = data['user'].nunique() - data_clean['user'].nunique()
+loss_events = data['event'].count() - data_clean['event'].count()
+print(f"\nПотери при фильтрации: {loss_users} пользователей (~{loss_users/data['user'].nunique():.2%}) и {loss_events} событий (~{loss_events/data['event'].count():.2%})")
+
+# 4. Анализ воронки событий
+# Подсчет количества событий и уникальных пользователей по каждому событию
+events_stats = data_clean.groupby('event').agg(
+    total_events=('event', 'count'),
+    unique_users=('user', 'nunique')
+).reset_index()
+events_stats = events_stats.sort_values(by='total_events', ascending=False)
+print("\nСтатистика по событиям:")
+print(events_stats)
+
+# Визуализация распределения событий на пользователя
+events_per_user = data_clean.groupby('user')['event'].count()
+plt.figure(figsize=(15, 4))
+plt.hist(events_per_user, bins=100, range=(200, 2310))
+plt.xlabel('Количество событий на пользователя')
+plt.ylabel('Количество пользователей')
+plt.title('Распределение активности пользователей')
+plt.grid()
+plt.show()
+print(f"\nМедиана событий на пользователя: {events_per_user.median()}")
+
+# Построение воронки (по уникальным пользователям)
+# Порядок событий в воронке: MainScreenAppear -> OffersScreenAppear -> CartScreenAppear -> PaymentScreenSuccessful
+funnel_order = ['MainScreenAppear', 'OffersScreenAppear', 'CartScreenAppear', 'PaymentScreenSuccessful']
+funnel_data = []
+total_users = data_clean.query("event == 'MainScreenAppear'")['user'].nunique()
+prev_step_users = total_users
+
+for i, event in enumerate(funnel_order):
+    users = data_clean.query("event == @event")['user'].nunique()
+    from_last = (users / prev_step_users * 100) if prev_step_users > 0 else 0
+    from_start = (users / total_users * 100) if total_users > 0 else 0
+
+    funnel_data.append({
+        'Этап': event,
+        'Пользователи': users,
+        'Конверсия с прошлого (%)': round(from_last, 1),
+        'Конверсия с начала (%)': round(from_start, 1)
+    })
+    prev_step_users = users
+
+funnel_df = pd.DataFrame(funnel_data)
+print("\nВоронка конверсии:")
+print(funnel_df)
+
+# Визуализация воронки (Funnel Chart)
+fig = go.Figure(go.Funnel(
+    y=funnel_df['Этап'],
+    x=funnel_df['Пользователи'],
+    textposition="inside",
+    textinfo="value+percent previous"
+))
+fig.update_layout(title='Воронка продаж')
+fig.show()
+
+# 5. Анализ результатов A/A/B эксперимента
+
+# Создание сводной таблицы: группы vs события
+pivot_table = data_clean.pivot_table(
+    index='group',
+    columns='event',
+    values='user',
+    aggfunc='nunique',
+    fill_value=0
+)
+# Удаляем событие Tutorial из анализа, так как оно не входит в основную воронку
+if 'Tutorial' in pivot_table.columns:
+    pivot_table.drop(columns=['Tutorial'], inplace=True)
+
+# Добавляем общее число пользователей в каждой группе
+users_per_group = data_clean.groupby('group')['user'].nunique()
+pivot_table['Total_Users'] = users_per_group
+
+# Функция для проверки статистической значимости разницы долей (Z-тест)
+def z_test_proportions(successes, trials, alpha):
+    p1 = successes[0] / trials[0]
+    p2 = successes[1] / trials[1]
+    p_pooled = (successes[0] + successes[1]) / (trials[0] + trials[1])
+    se = np.sqrt(p_pooled * (1 - p_pooled) * (1/trials[0] + 1/trials[1]))
+    z_score = (p1 - p2) / se
+    p_value = (1 - stats.norm.cdf(abs(z_score))) * 2
+
+    print(f"p-value: {p_value:.4f}, alpha: {alpha}")
+    if p_value < alpha:
+        print("Результат статистически значим. Гипотеза о равенстве долей отвергается.")
+    else:
+        print("Разница не является статистически значимой.")
+    print("-" * 50)
+    return p_value
+
+# Параметры для теста
+alpha_initial = 0.1
+num_tests = len(pivot_table.columns) - 1 # Исключаем колонку Total_Users
+
+# Поправка Шидака для множественной проверки гипотез
+alpha_corrected = 1 - (1 - alpha_initial) ** (1 / num_tests)
+print(f"Изначальный уровень значимости (alpha): {alpha_initial}")
+print(f"Количество проверок гипотез: {num_tests}")
+print(f"Исправленный уровень значимости по Шидаку: {alpha_corrected:.4f}\n")
+
+# Сравнение групп: A(246) vs B(248), A'(247) vs B(248), Объединенная A/A(246_247) vs B(248)
+comparisons = [
+    ("Группа 246 vs Группа 248", 246, 248),
+    ("Группа 247 vs Группа 248", 247, 248),
+]
+
+for name, g1, g2 in comparisons:
+    print(f"\n--- Сравнение {name} ---")
+    trials = [pivot_table.loc[g1, 'Total_Users'], pivot_table.loc[g2, 'Total_Users']]
+    
+    for event in ['MainScreenAppear', 'OffersScreenAppear', 'CartScreenAppear', 'PaymentScreenSuccessful']:
+        successes = [pivot_table.loc[g1, event], pivot_table.loc[g2, event]]
+        print(f"\nСобытие: {event}")
+        z_test_proportions(successes, trials, alpha_corrected)
